@@ -1,0 +1,1502 @@
+---
+title: "ALP 301 COVID Project - Data input, cleaning and analysis"
+author: "Zelin Li, Vivan Malkani, Niki Panich, Maria Fernanda Porras"
+date: "May 2020"
+output:
+  html_document:
+    highlight: haddock
+    theme: journal
+    number_sections: no
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+---
+ 
+<style>
+div.blue { background-color:#e6f0ff; border-radius: 5px; padding: 20px;}
+</style>
+ 
+<style>
+div.medblue { background-color: #b3d1ff; border-radius: 5px; padding: 5px;}
+</style>
+ 
+<style>
+div.darkblue { background-color: #9ac2ff; border-radius: 5px; padding: 5px;}
+</style>
+ 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(naniar)
+library(ggthemes)
+library(RColorBrewer)
+library(cowplot)
+library(boot)
+library(writexl)
+library(lubridate)
+library(plm)
+library(lmtest)
+library(estimatr)
+library(kableExtra)
+library(reshape2)
+library(randomizr)
+library(naniar)
+```
+
+## Data Entry 
+### Partition data into pilot and non-pilot data
+```{r data entry}
+snapshot <- read_xlsx("data/PHL_survey_snapshot.xlsx")
+
+pilot <- snapshot %>% 
+  filter(day(as_date(str_extract(`signed up`, "[:digit:][:digit:]-[:digit:][:digit:]-[:digit:][:digit:]"))) < 14)
+write_xlsx(pilot, "data/pilot_data.xlsx")
+
+post_pilot_data <- snapshot %>% 
+  filter(day(as_date(str_extract(`signed up`, "[:digit:][:digit:]-[:digit:][:digit:]-[:digit:][:digit:]"))) >= 14)
+
+write_xlsx(post_pilot_data, "data/unfiltered_non_pilot_data.xlsx")
+```
+
+## Power calculations from pilot data
+
+The objective of this section is to present the power calculations for our experiment on COVID, using the data from the first two days of the survey as a pilot, to determine the correct size for our experiment, given that we don't know how are our mus going to behave.
+ 
+### Pilot dataset Cleaning and Processing
+
+```{r pilot data entry}
+pilot <- read_xlsx("data/pilot_data.xlsx")
+
+pilot <- pilot %>% 
+  mutate(consent = as.numeric(consent),
+         out_clickpost = as.numeric(out_clickpost),
+         cov_resources_fig = as.numeric(cov_resources_fig)) %>% 
+  select(1:46)
+
+# filtering, only using data of people that consent
+pilot <- pilot %>% filter(consent == 1)
+```
+
+
+**Calcuate mean and sd for post share rate to use as prior**
+
+```{r postshare}
+results_share <- pilot %>% group_by(share_post_assign, out_clickpost) %>% tally()
+doh_total <- results_share[1,3] + results_share[2,3]
+doh_shared <- results_share[2,3]
+med_total <- results_share[3,3] + results_share[4,3]
+med_shared <- results_share[4,3]
+ngo_total <- results_share[5,3] + results_share[6,3]
+ngo_shared <- results_share[6,3]
+
+
+ 
+pilot <- pilot %>% mutate(doh = ifelse(share_post_assign == "doh" & 
+                                         out_clickpost == 1,
+                                       1, ifelse(share_post_assign == "doh", 0, NA)),
+                          med = ifelse(share_post_assign == "med" & 
+                                         out_clickpost == 1,
+                                       1, ifelse(share_post_assign == "med", 0, NA)),
+                          ngo = ifelse(share_post_assign == "ngo" & 
+                                         out_clickpost == 1,
+                                       1, ifelse(share_post_assign == "ngo", 0, NA)))
+                          
+
+sigma.doh <- sd(pilot$doh, na.rm = TRUE)
+sigma.med <- sd(pilot$med, na.rm = TRUE)
+sigma.ngo <- sd(pilot$ngo, na.rm = TRUE)
+ 
+mean.doh <- as.numeric(doh_shared/doh_total)
+mean.ngo <- as.numeric(ngo_shared/ngo_total)
+mean.med <- as.numeric(med_shared/med_total)
+```
+
+$$\begin{aligned}
+\mu_{ngo} &= 0.1228 \\
+\mu_{gov} &= 0.1000 \\
+\mu_{med} &= 0.0816 \\
+\sigma &= 0.3055
+\end{aligned}$$
+
+**Do the same for click through rate.**
+
+
+
+```{r click}
+pilot <- pilot %>% mutate(click = ifelse(out_clickinfo_gov == 1 | out_clickinfo_med == 1 |
+                                           out_clickinfo_ngo == 1, 1,
+                                         ifelse(out_clickinfo_gov == 0 | out_clickinfo_med == 0 |
+                                                  out_clickinfo_ngo == 0, 0, NA)))
+ 
+pilot <- pilot %>% mutate(CTR_cx = ifelse(cov_resources_fig == 0 & click == 0, 0,
+                                          ifelse(cov_resources_fig == 0 & click == 1, 1, NA)))
+pilot <- pilot %>% mutate(CTR_tx = ifelse(cov_resources_fig == 1 & click == 0, 0,
+                       ifelse(cov_resources_fig == 1 & click == 1, 1, NA)))
+ 
+pilot <- pilot %>% mutate(CTR= ifelse(click == 1, 1, ifelse(cov_resources_fig == 0 | cov_resources_fig == 1, 0, NA)))
+mean.ctr <- mean(pilot$CTR, na.rm = TRUE)
+sd.ctr <- sd(pilot$CTR, na.rm = TRUE)
+ 
+mean.cx <- mean(pilot$CTR_cx, na.rm = TRUE)
+sigma.cx <- sd(pilot$CTR_cx, na.rm = TRUE)
+mean.tx <- mean(pilot$CTR_tx, na.rm = TRUE)
+```
+ 
+ 
+### Power Calculation Function
+
+```{r power_calculator}
+# Power Calculator for Comparing against a Baseline Control Group
+power_calculator <- function(mus, # treatment means
+                             mu_0, # control mean
+                             sigma = 1, # standard deviation
+                             alpha = 0.05, # significance level
+                             N, # experiment size
+                             hypothesis = "two.tailed" # type of hypothesis
+) {
+  n <- length(mus) # number of comparisons
+  # The tails of our statistics distributions
+  lowertails <- (abs(mus - mu_0) * sqrt(N)) / (sigma * sqrt(2 * (n + 1)))
+  uppertails <- -1 * lowertails
+  if (hypothesis == "two.tailed") {
+    # HA: \mus \neq \mu_0
+    pwr_atleastone <- max(pnorm(lowertails - qnorm(1 - (alpha / 2) / n),
+      lower.tail = TRUE
+    ) +
+      1 - pnorm(uppertails - qnorm(1 - (alpha / 2) / n),
+        lower.tail = FALSE
+      ))
+    pwr_all <- min(pnorm(lowertails - qnorm(1 - (alpha / 2)),
+      lower.tail = TRUE
+    ) +
+      1 - pnorm(uppertails - qnorm(1 - (alpha / 2)),
+        lower.tail = FALSE
+      ))
+  } else if (hypothesis == "greater") {
+    # HA: \mus > \mu_0
+    pwr_atleastone <- max(pnorm(lowertails - qnorm(1 - alpha / n),
+      lower.tail = TRUE
+    ))
+    pwr_all <- min(pnorm(lowertails - qnorm(1 - alpha), lower.tail = TRUE))
+  } else if (hypothesis == "lower") {
+    # HA: \mus < \mu_0
+    pwr_atleastone <- max(1 - pnorm(uppertails - qnorm(1 - alpha / n),
+      lower.tail = FALSE
+    ))
+    pwr_all <- min(1 - pnorm(uppertails - qnorm(1 - alpha), lower.tail = FALSE))
+  }
+  return(c(pwr_atleastone, pwr_all))
+}
+
+# Power Calculator for Pairwise Comparison
+power_calculator_multiple <- function(mus,
+                                      sigma = 1, # standard deviation
+                                      alpha = 0.05, # significance level
+                                      N, # experiment size
+                                      hypothesis = "two.tailed" # type of hypothesis
+) {
+  n <- length(mus) # number of comparisons
+  # The tails of our statistics distributions
+  diff <- c()
+  for (i in 1:(n-1)){
+    diff <- c(diff, abs(mus[i] - mus[(i+1):n]))
+  }
+  lowertails <- (abs(diff) * sqrt(N)) / (sigma * sqrt(2 * (n + 1)))
+  uppertails <- -1 * lowertails
+  if (hypothesis == "two.tailed") {
+    # HA: \mus \neq \mu_0
+    pwr_atleastone <- max(pnorm(lowertails - qnorm(1 - (alpha / 2) / n),
+      lower.tail = TRUE
+    ) +
+      1 - pnorm(uppertails - qnorm(1 - (alpha / 2) / n),
+        lower.tail = FALSE
+      ))
+    pwr_all <- min(pnorm(lowertails - qnorm(1 - (alpha / 2)),
+      lower.tail = TRUE
+    ) +
+      1 - pnorm(uppertails - qnorm(1 - (alpha / 2)),
+        lower.tail = FALSE
+      ))
+  } else if (hypothesis == "greater") {
+    # HA: \mus > \mu_0
+    pwr_atleastone <- max(pnorm(lowertails - qnorm(1 - alpha / n),
+      lower.tail = TRUE
+    ))
+    pwr_all <- min(pnorm(lowertails - qnorm(1 - alpha), lower.tail = TRUE))
+  } else if (hypothesis == "lower") {
+    # HA: \mus < \mu_0
+    pwr_atleastone <- max(1 - pnorm(uppertails - qnorm(1 - alpha / n),
+      lower.tail = FALSE
+    ))
+    pwr_all <- min(1 - pnorm(uppertails - qnorm(1 - alpha), lower.tail = FALSE))
+  }
+  return(c(pwr_atleastone, pwr_all))
+}
+ 
+```
+ 
+The first output of the function is the power for rejecting _at least one_ of the null hypotheses. The second output of the function is the power for rejecting _all_ of the null hypotheses.
+ 
+### Calculating the power for post sharing
+
+
+```{r post sharing power}
+mus <- c(mean.doh, mean.med, mean.ngo)
+sigma <- as.numeric(sqrt((sigma.ngo^2 * (ngo_total - 1) + sigma.med^2 * (med_total - 1) + sigma.doh^2 * (doh_total - 1)) / (med_total + ngo_total + doh_total - 3))) # pooled variance
+hypothesis <- "two.tailed"
+ 
+poss.ns <- seq(50, 30000) # potential experiment size
+ 
+pwr_mat <- sapply(poss.ns, function(n) {
+  power_calculator_multiple(
+    mus = mus,
+    sigma = sigma,
+    alpha = 0.05,
+    N = n,
+    hypothesis = hypothesis
+  )
+})
+ 
+# plot the power
+gg_df <- data.frame(N = poss.ns, `At least one` = pwr_mat[1, ], All = pwr_mat[2, ])
+ 
+gg_df <- gg_df %>% melt(
+  id.vars = "N", value.name = "Power",
+  variable.name = "Type"
+)
+gg_power <- ggplot(gg_df, aes(x = N, y = Power, group = Type, col = Type)) +
+  geom_line() +
+  geom_segment(aes(
+    x = poss.ns[min(which(pwr_mat[1, ] > 0.8))],
+    y = min(pwr_mat[1, ]),
+    xend = poss.ns[min(which(pwr_mat[1, ] > 0.8))],
+    yend = pwr_mat[1, min(which(pwr_mat[1, ] > 0.8))]
+  ),
+  data = gg_df, colour = "blue", lty = "dashed"
+  ) +
+  geom_segment(aes(
+    x = min(poss.ns),
+    y = pwr_mat[1, min(which(pwr_mat[1, ] > 0.8))],
+    xend = poss.ns[min(which(pwr_mat[1, ] > 0.8))],
+    yend = pwr_mat[1, min(which(pwr_mat[1, ] > 0.8))]
+  ),
+  data = gg_df, colour = "blue", lty = "dashed"
+  ) +
+  geom_segment(aes(
+    x = poss.ns[min(which(pwr_mat[2, ] > 0.8))],
+    y = min(pwr_mat[2, ]),
+    xend = poss.ns[min(which(pwr_mat[2, ] > 0.8))],
+    yend = pwr_mat[2, min(which(pwr_mat[2, ] > 0.8))]
+  ),
+  data = gg_df, colour = "blue", lty = "dashed"
+  ) +
+  geom_segment(aes(
+    x = min(poss.ns),
+    y = pwr_mat[2, min(which(pwr_mat[2, ] > 0.8))],
+    xend = poss.ns[min(which(pwr_mat[2, ] > 0.8))],
+    yend = pwr_mat[2, min(which(pwr_mat[2, ] > 0.8))]
+  ),
+  data = gg_df, colour = "blue", lty = "dashed"
+  ) +
+  scale_y_continuous(breaks = seq(0.2, 1, .2))
+ 
+gg_power
+```
+ 
+We find our targeted power, .80, at an experiment size of N = 17374 to reject all of the hypotheses.
+ 
+### Calculating the power for click through rate (CTR)
+
+Note: We added a treatment arm (infographic) after having the pilot data, thus we are estiamting the click through rate to be 2%, which is a reasonable (slightly high) estimate given the click through rate data on social media. We also used 2% for our other treatment arm (image) as the estimate from pilot data (with only size around 200) is 0%, which is unreasonable.
+ 
+```{r CTR power function}
+mus <- c(0.0195, 0.0226) 
+mu_0 <- 0.0273
+sigma <- mean.cx
+hypothesis <- "two.tailed"
+poss.ns <- seq(50, 10000) # potential experiment size
+
+pwr_mat <- sapply(poss.ns, function(n) {
+  power_calculator(
+    mus = mus,
+    mu_0 = mu_0,
+    sigma = sigma,
+    alpha = 0.05,
+    N = n,
+    hypothesis = hypothesis
+  )
+})
+
+gg_df <- data.frame(N = poss.ns, `At least one` = pwr_mat[1, ], All = pwr_mat[2, ])
+gg_df <- gg_df %>% melt(
+  id.vars = "N", value.name = "Power",
+  variable.name = "Type"
+)
+
+
+gg_power <- ggplot(gg_df, aes(x = N, y = Power, group = Type, col = Type)) +
+  geom_line() +
+  geom_segment(aes(
+    x = poss.ns[min(which(pwr_mat[1, ] > 0.8))],
+    y = min(pwr_mat[1, ]),
+    xend = poss.ns[min(which(pwr_mat[1, ] > 0.8))],
+    yend = pwr_mat[1, min(which(pwr_mat[1, ] > 0.8))]
+  ),
+  data = gg_df, colour = "blue", lty = "dashed"
+  ) +
+  geom_segment(aes(
+    x = min(poss.ns),
+    y = pwr_mat[1, min(which(pwr_mat[1, ] > 0.8))],
+    xend = poss.ns[min(which(pwr_mat[1, ] > 0.8))],
+    yend = pwr_mat[1, min(which(pwr_mat[1, ] > 0.8))]
+  ),
+  data = gg_df, colour = "blue", lty = "dashed"
+  ) +
+  geom_segment(aes(
+    x = poss.ns[min(which(pwr_mat[2, ] > 0.8))],
+    y = min(pwr_mat[2, ]),
+    xend = poss.ns[min(which(pwr_mat[2, ] > 0.8))],
+    yend = pwr_mat[2, min(which(pwr_mat[2, ] > 0.8))]
+  ),
+  data = gg_df, colour = "blue", lty = "dashed"
+  ) +
+  geom_segment(aes(
+    x = min(poss.ns),
+    y = pwr_mat[2, min(which(pwr_mat[2, ] > 0.8))],
+    xend = poss.ns[min(which(pwr_mat[2, ] > 0.8))],
+    yend = pwr_mat[2, min(which(pwr_mat[2, ] > 0.8))]
+  ),
+  data = gg_df, colour = "blue", lty = "dashed"
+  ) +
+  scale_y_continuous(breaks = seq(0.2, 1, .2))
+ 
+gg_power
+```
+ 
+##################################################################################################
+## Data Cleaning
+##################################################################################################
+This section involves removing mistyped/outlier values from the dataset for each demographic variable as well as visualization of distribution to identify cutoff points
+
+```{r consent and NAs}
+#Consent distribution
+post_pilot_data <- post_pilot_data %>% filter(consent == 1)
+survey_data <- post_pilot_data
+
+#Age, Sex, Marital, Post Treatment, Religion, School, School_Level, # of people in household, Region
+survey_data <- survey_data %>% 
+  filter_at(vars(age,sex, marital, language, region, school, school_level, hhold, share_post_assign), all_vars(!is.na(.)))
+```
+
+### Age
+```{r age dist}
+#Age distribution
+survey_data %>% group_by(age) %>% tally()
+
+survey_data <- survey_data %>% filter(age < 100)
+
+survey_data %>% ggplot() + 
+  geom_histogram(aes(age), color = "black", fill = "lightgrey", binwidth = 1) +
+  scale_x_continuous(breaks = seq(20,90,10)) +
+  theme_clean() + 
+  ggtitle("Survey Population Age Distribution") + 
+  xlab("Age") + 
+  ylab("Number of respondents")+
+  theme(axis.title = element_text(size = 12),
+        axis.text.y = element_text(size = 8),
+        title = element_text(size = 16))
+
+```
+
+### Gender
+```{r gender dist}
+#Sex distribution
+#survey_data %>% group_by(sex) %>% tally() %>% arrange(desc(n)) %>% View()
+
+sex_values <- c("female", "male", "girl","boy", "lalake", "lalaki", "babae", "skip", "next", "walang sagot")
+male = c("^male", "boy", "lalake", "lalaki")
+female = c("female", "girl", "babae")
+skip_options = c("next", "skip", "no answer", "walang sagot")
+
+queries <- survey_data %>% 
+  filter(str_detect(sex, regex(paste(sex_values, collapse = "|"), ignore_case = T))) %>%
+  mutate(sex_modified = case_when(
+   str_detect(sex, regex(paste(male, collapse = "|"), ignore_case = T)) ~  "M",
+   str_detect(sex, regex(paste(female, collapse = "|"), ignore_case = T)) ~ "F",
+   str_detect(sex, regex(paste(skip_options, collapse = "|"), ignore_case = T)) ~ "No Answer",
+   TRUE ~ "Other"
+  ))
+
+queries %>% 
+  filter(sex_modified!="Other") %>%  
+  ggplot() + 
+  geom_bar(aes(sex_modified)) +
+  theme_clean() + 
+  ggtitle("Sex Distribution") + 
+  xlab("Sex") + 
+  ylab("Number of respondents")
+
+survey_data <- queries %>% filter(sex_modified!="Other") 
+```
+
+### Marital Status
+```{r marital dist}
+#marital
+#survey_data %>% group_by(marital) %>% tally() %>% arrange(desc(n)) %>% View()
+
+#Single, Married, Divorced/separated, Widowed, Common-law/live-in, Other/ No answer
+queries <- survey_data %>% 
+  mutate(marital_modified = case_when(
+    str_detect(marital, regex("(?<![:alpha:])a(?![:alpha:])", ignore_case = T)) ~ "Single",
+    str_detect(marital, regex("(?<![:alpha:])b(?![:alpha:])", ignore_case = T)) ~ "Married",
+    str_detect(marital, regex("(?<![:alpha:])c(?![:alpha:])", ignore_case = T)) ~ "Divorced/Separated",
+    str_detect(marital, regex("(?<![:alpha:])d(?![:alpha:])", ignore_case = T)) ~ "Widowed",
+    str_detect(marital, regex("(?<![:alpha:])e(?![:alpha:])", ignore_case = T)) ~ "Common-law/live-in",
+    str_detect(marital, regex("(?<![:alpha:])f(?![:alpha:])", ignore_case = T))|
+      str_detect(marital, regex(paste(skip_options, collapse = "|"), ignore_case = T)) ~ "No Answer",
+    TRUE ~ "Other"))
+
+queries %>% ggplot() + 
+  geom_bar(aes(marital_modified)) +
+  theme_clean() + 
+  ggtitle("Marital Status Distribution") + 
+  xlab("Marital Status") + 
+  ylab("Number of respondents") +
+  theme(axis.text.x = element_text(angle = 90))
+
+survey_data = queries %>% filter(marital_modified!="Other") 
+```
+
+### Education attainment level
+```{r school and school level dist}
+#school
+yes = c("yes", "oo")
+no = c("no", "hindi")
+
+
+queries <- survey_data %>% 
+  mutate(school_modified = case_when(
+   str_detect(school, regex(paste(yes, collapse = "|"), ignore_case = T)) ~  "Yes",
+   str_detect(school, regex(paste(no, collapse = "|"), ignore_case = T)) ~ "No",
+   str_detect(sex, regex(paste(skip_options, collapse = "|"), ignore_case = T)) ~ "No Answer",
+   TRUE ~ "Other"
+  ))
+
+queries %>% ggplot() + 
+  geom_bar(aes(school_modified)) +
+  theme_clean() + 
+  ggtitle("School Status Distribution") + 
+  xlab("School Status") + 
+  ylab("Number of respondents") +
+  theme(axis.text.x = element_text(angle = 90))
+
+survey_data = queries %>% filter(school_modified!="Other") 
+
+#school_level, 
+#Choices: None, Preschool, Elementary grad, High school grad, Post secondary grad, College grad, Post baccalaureate, Don't know/No answer
+#survey_data %>% group_by(school_level) %>% tally() %>% arrange(desc(n)) %>% View()
+
+#Single, Married, Divorced/separated, Widowed, Common-law/live-in, Other/ No answer
+queries <- survey_data %>% 
+  mutate(school_level_modified = case_when(
+    str_detect(school_level, regex("(?<![:alpha:])a(?![:alpha:])", ignore_case = T)) ~ "None",
+    str_detect(school_level, regex("(?<![:alpha:])b(?![:alpha:])", ignore_case = T)) ~ "Preschool",
+    str_detect(school_level, regex("(?<![:alpha:])c(?![:alpha:])", ignore_case = T)) ~ "Elementary grad",
+    str_detect(school_level, regex("(?<![:alpha:])d(?![:alpha:])", ignore_case = T)) ~ "High school grad",
+    str_detect(school_level, regex("(?<![:alpha:])e(?![:alpha:])", ignore_case = T)) ~ "Post secondary grad",
+    str_detect(school_level, regex("(?<![:alpha:])f(?![:alpha:])", ignore_case = T)) ~ "College grad",
+    str_detect(school_level, regex("(?<![:alpha:])g(?![:alpha:])", ignore_case = T)) ~ "Post baccalaureate",
+    str_detect(school_level, regex("(?<![:alpha:])h(?![:alpha:])", ignore_case = T))|
+      str_detect(school_level, regex(paste(skip_options, collapse = "|"), ignore_case = T)) ~ "No Answer",
+    TRUE ~ "Other")) %>%
+  mutate(school_level_modified = factor(school_level_modified, levels=c("None", "Preschool", "Elementary grad", "High school grad", "Post secondary grad", "College grad", "Post baccalaureate")))
+
+queries %>% ggplot() + 
+  geom_bar(aes(school_level_modified)) +
+  theme_clean() + 
+  ggtitle("School Level Distribution") + 
+  xlab("School Level") + 
+  ylab("Number of respondents") +
+  theme(axis.text.x = element_text(angle = 90))
+
+survey_data = queries %>% filter(school_level_modified!="Other") 
+```
+
+### Household size
+```{r number of household members dist}
+#survey_data %>% group_by(hhold) %>% tally() %>% arrange(desc(n)) %>% View()
+
+queries <- survey_data %>%
+  mutate(hhold = case_when(
+    hhold %in% c("1.0", "2.0", "3.0", "4.0", "5.0", "6.0","7.0", "8.0", "9.0", "10.0", "11.0", 
+                 "12.0", "13.0", "14.0", "15.0", "16.0", "17.0", "18.0") ~ hhold,
+    str_detect(hhold, regex(paste(skip_options, collapse = "|"), ignore_case = T)) ~ "No Answer",
+    TRUE ~ "Other"))
+
+queries %>% 
+  ggplot() + 
+  geom_bar(aes(x = hhold)) +
+  theme_clean() + 
+  ggtitle("Household Size Distribution") + 
+  xlab("Household Size") +
+  theme(axis.text.x = element_text(angle = 90))
+  
+  
+survey_data = queries %>% filter(hhold!="Other") 
+```
+
+### Geographic distribution of participants
+```{r region dist}
+
+# a : NCR
+# b : I Illocos
+# c : II Cagayan Valley
+# d : III Central Luzon
+# e : IV-A Calabarzon
+# f : Mimaropa
+# g : V Bicol
+# h : VI Western Visayas
+# i : VII Central Visayas
+# j : VIII Eastern Visayas
+# k : IX Zamboanga Peninsula
+# l : X Northern Mindanao
+# m : XI Davao Region
+# n : XII Soccsksargen
+# o : XIII Caraga Region 
+# p: XIV Cordillera Administrative Region
+# q : BARMM
+# r : Other/N/A
+
+queries <- survey_data %>%
+  mutate(region_modified = case_when(
+    str_detect(region, regex("(?<![:alpha:])a(?![:alpha:])", ignore_case = T)) ~ "NCR",
+    str_detect(region, regex("(?<![:alpha:])b(?![:alpha:])", ignore_case = T)) ~ "Illocos",
+    str_detect(region, regex("(?<![:alpha:])c(?![:alpha:])", ignore_case = T)) ~ "Cagayan Valley",
+    str_detect(region, regex("(?<![:alpha:])d(?![:alpha:])", ignore_case = T)) ~ "Central Luzon",
+    str_detect(region, regex("(?<![:alpha:])e(?![:alpha:])", ignore_case = T)) ~ "Calabarzon",
+    str_detect(region, regex("(?<![:alpha:])f(?![:alpha:])", ignore_case = T)) ~ "Mimaropa",
+    str_detect(region, regex("(?<![:alpha:])g(?![:alpha:])", ignore_case = T)) ~ "Bicol",
+    str_detect(region, regex("(?<![:alpha:])h(?![:alpha:])", ignore_case = T)) ~ "Western Visayas",
+    str_detect(region, regex("(?<![:alpha:])i(?![:alpha:])", ignore_case = T)) ~ "Central Visayas",
+    str_detect(region, regex("(?<![:alpha:])j(?![:alpha:])", ignore_case = T)) ~ "Eastern Visayas",
+    str_detect(region, regex("(?<![:alpha:])k(?![:alpha:])", ignore_case = T)) ~ "Zamboanga Peninsula",
+    str_detect(region, regex("(?<![:alpha:])l(?![:alpha:])", ignore_case = T)) ~ "Northern Mindanao",
+    str_detect(region, regex("(?<![:alpha:])m(?![:alpha:])", ignore_case = T)) ~ "Davao",
+    str_detect(region, regex("(?<![:alpha:])n(?![:alpha:])", ignore_case = T)) ~ "Soccsksargen",
+    str_detect(region, regex("(?<![:alpha:])o(?![:alpha:])", ignore_case = T)) ~ "Caraga ",
+    str_detect(region, regex("(?<![:alpha:])p(?![:alpha:])", ignore_case = T)) ~ "CAR",
+    str_detect(region, regex("(?<![:alpha:])q(?![:alpha:])", ignore_case = T)) ~ "BARMM",
+    str_detect(hhold, regex(paste(skip_options, collapse = "|"), ignore_case = T)) ~ "No Answer",
+    TRUE ~ "Other"))
+
+queries %>% 
+  ggplot() + 
+  geom_bar(aes(x = region_modified)) +
+  theme_clean() + 
+  ggtitle("Region Distribution") + 
+  xlab("Region Size") +
+  theme(axis.text.x = element_text(angle = 90))
+  
+  
+survey_data = queries %>% filter(region_modified!="Other") 
+
+
+```
+
+### Save cleaned data
+```{r save cleaned data}
+write_xlsx(survey_data, "data/cleaned_input.xlsx")
+
+#Percentage retained of original responses that consented
+nrow(survey_data)/nrow(post_pilot_data)
+total_retained = nrow(survey_data)
+```
+
+## Data Visualization
+
+This section involves comparing the distribution of demographic and geographic variables in the data with 2015 Philippines Census data to show understand how representative the study sample is. 
+
+### Read in census data
+```{r census data, include=FALSE}
+census2015 <- read_csv("data/180816_philippines-population-region-admin-1_2015.csv")
+```
+
+### Region visualization
+```{r VIS region }
+region_population <- census2015 %>%
+  mutate(total_f = select(., F18:F100_Over) %>% rowSums(),
+         total_m = select(., M18:M100_Over) %>% rowSums(),
+         total = total_m + total_f) %>%
+  select(region = adm1_name, total_f, total_m, total) 
+
+region_population <- region_population %>% bind_cols(known_region = c("Ilocos", "Cagayan", "Central Luzon", "Calabarzon", "Bicol", "Western Visayas", "Central Visayas", "Eastern Visayas", "Zamboanga Peninsula", "Northern Mindanao", "Davao", "Soccsksargen", "NCR", "CAR", "BARMM", "Caraga", "Mimaropa"))
+
+p1 <- region_population %>%  
+  ggplot() + 
+  geom_col(aes(x= known_region, y = total/(10^6))) + 
+  ggtitle("Census Population Distribution by Region 2015", 
+          paste0(subtitle = "Total eligible population: ", 
+                 "~82.97M")) + 
+  theme_clean() + 
+  xlab("")+ 
+  ylab("Population (M)") +
+  theme(axis.text.x = element_text(angle = 55, size = 8, vjust = 0.6),
+        axis.title = element_text(size = 12),
+        axis.text.y = element_text(size = 8),
+        title = element_text(size = 16))
+
+p2 <- survey_data %>%  
+  filter(region_modified != "No Answer") %>% 
+  ggplot() + 
+  geom_bar(aes(x= region_modified)) + 
+  ggtitle("Survey Population Distribution by Region", subtitle = paste0("Total number of observations: ", total_retained)) + 
+  theme_clean() + 
+  xlab("")+ 
+  ylab("Number of Observations") +
+  theme(axis.text.x = element_text(angle = 55, size = 8, vjust = 0.6),
+        axis.text.y = element_text(angle = 0, size = 8),
+        axis.title = element_text(size = 12),
+        title = element_text(size = 16))
+
+png("graphics/region_population_comparison.png", width = 600, height = 500)
+plot_grid(p1, p2, nrow = 2)
+dev.off()
+```
+
+### Age visualization
+```{r VIS age}
+age_census <- census2015 %>% 
+  select(F18:F100_Over,M18:M100_Over) %>% 
+  summarise_all(sum) %>% gather(key = "age", value = "population") %>% 
+  mutate(age = as.integer(str_replace(age, "[:alpha:]", ""))) %>%
+  group_by(age) %>%
+  summarise(population = sum(population))
+
+p1 = age_census %>% ggplot() + 
+  geom_col(aes(x= age, y = population/10^6), color = "black", fill = "lightgrey") + 
+  ggtitle("Census Population Distribution by Age 2015", 
+          paste0(subtitle = "Total eligible population: ", 
+                 "~82.97M")) + 
+  theme_clean() + 
+  xlab("Age")+ 
+  ylab("Population (M)") +
+  theme(axis.title = element_text(size = 12),
+        axis.text.y = element_text(size = 8),
+        title = element_text(size = 16)) +
+  scale_x_continuous(breaks = seq(20,90,10))
+
+p2 = survey_data %>% 
+  ggplot() + 
+  geom_histogram(aes(age), color = "black", fill = "lightgrey", binwidth = 1) +
+  scale_x_continuous(breaks = seq(20,90,10)) +
+  theme_clean() + 
+  ggtitle("Survey Population Distribution by Age", subtitle = paste0("Total number of observations: ", total_retained)) + 
+  xlab("Age") + 
+  ylab("Number of respondents")+
+  theme(axis.title = element_text(size = 12),
+        axis.text.y = element_text(size = 8),
+        title = element_text(size = 16))
+
+png("graphics/age_comparison.png", width = 600, height = 500)
+plot_grid(p1, p2, nrow = 2)
+dev.off()
+```
+
+### Gender visualization
+```{r VIS gender}
+sex_census <- census2015 %>% 
+  select(F18:F100_Over,M18:M100_Over) %>% 
+  summarise_all(sum) %>% gather(key = "age", value = "population") %>% 
+  mutate(sex = ifelse(str_detect(age, "F"),"F","M")) %>%
+  group_by(sex) %>%
+  summarise(population = sum(population))
+
+p1 = sex_census %>% ggplot() + 
+  geom_col(aes(x= sex, y = population/10^6), color = "black", fill = "lightgrey") + 
+  ggtitle("Census Sex Distribution by Age 2015", 
+          paste0(subtitle = "Total eligible population: ", 
+                 "~82.97M")) + 
+  theme_clean() + 
+  xlab("Age")+ 
+  ylab("Population (M)") +
+  theme(axis.title = element_text(size = 12),
+        axis.text.y = element_text(size = 8),
+        title = element_text(size = 16))
+
+p2 = survey_data %>%
+  filter(sex_modified!= "No Answer") %>%
+  ggplot() + 
+  geom_bar(aes(sex_modified), color = "black", fill = "lightgrey") +
+  theme_clean() + 
+  ggtitle("Survey Population Sex Distribution", subtitle = paste0("Total number of observations: ", total_retained)) + 
+  xlab("Age") + 
+  ylab("Number of respondents")+
+  theme(axis.title = element_text(size = 12),
+        axis.text.y = element_text(size = 8),
+        title = element_text(size = 16))
+
+survey_data %>% filter(sex_modified == "F") %>% nrow() / nrow(survey_data) #58%
+survey_data %>% filter(sex_modified == "M") %>% nrow() / nrow(survey_data) #42%
+sex_census$population[sex_census$sex == "F"] / sum(sex_census$population) #50%
+sex_census$population[sex_census$sex == "M"] / sum(sex_census$population) #50%
+
+png("graphics/sex_comparison.png", width = 600, height = 500)
+plot_grid(p1, p2, nrow = 2)
+dev.off()
+
+
+```
+
+### Household size visualization
+```{r VIS hhold}
+png("graphics/hhold.png", width = 500, height = 400)
+survey_data %>% filter(hhold != "No Answer") %>% ggplot() + 
+  geom_bar(aes(as.integer(hhold))) +
+  theme_clean() + 
+  ggtitle("Distribution of Household Size") + 
+  xlab("") + 
+  ylab("Number of respondents") +
+  theme(axis.text.x = element_text(angle = 0))
+dev.off()
+```
+
+### Education attainment level visualization
+```{r VIS schooling}
+#UNESCO UIS 2017
+educ_attainment = read_xlsx("data/educ_attainment.xlsx", sheet = "PH", col_names = F) %>% 
+  t() %>% 
+  data.frame() %>%
+  filter(X2 == "MF") %>%
+  select(level = X1, population = X3) %>%
+  slice(-1)
+
+pct = c(1.99, 13.97, 24.63, 39.33,0,4.05,0,15.63,0.34, 4.689E-2, 1.176E-2)
+
+educ_attainment <- educ_attainment %>%
+  mutate(level = case_when(
+           level == "No schooling\r\n(%)" ~ "None",
+           level %in% c("Incomplete primary (%)") ~ "Preschool",
+           level %in% c("Primary\r\n(ISCED 1) (%)") ~ "Elementary grad",
+           level %in% c("Lower secondary (ISCED 2) (%)") ~ "High school grad",
+           level %in% c("Post-secondary non-tertiary (ISCED 4) (%)") ~ "Post secondary grad",
+           level %in% c("Bachelor's or equivalent (ISCED 6) (%)") ~ "College grad",
+           level %in% c("Master's or equivalent (ISCED 7) (%)","Doctoral or equivalent (ISCED 8) (%)") ~ "Post baccalaureate",
+           TRUE ~ "Other")) %>%
+  mutate(level = factor(level, levels=c("None", "Preschool", "Elementary grad", "High school grad", "Post secondary grad", "College grad", "Post baccalaureate")),
+         pct = pct)
+
+
+
+p1 = educ_attainment %>% 
+  filter(level!= "Other") %>%
+  ggplot() + 
+  geom_col(aes(x = as.factor(level), y = pct)) +
+  theme_clean() + 
+  ggtitle("National School Level Distribution", subtitle = "UNESCO UIS 2017, Age 25+") + 
+  xlab("Highest School Level Attained") + 
+  ylab("Percentage") +
+  theme(axis.text.x = element_text(angle = 90))
+
+p2 = survey_data %>% 
+  filter(school_level_modified!= "No Answer") %>%
+  ggplot() + 
+  geom_bar(aes(as.factor(school_level_modified))) +
+  theme_clean() + 
+  ggtitle("Survey School Level Distribution", subtitle = paste0("Total number of observations: ", total_retained)) + 
+  xlab("Highest School Level Attained") + 
+  ylab("Number of respondents") +
+  theme(axis.text.x = element_text(angle = 90))
+
+png("graphics/school_comparison.png", width = 600, height = 500)
+plot_grid(p1, p2, nrow = 2)
+dev.off()
+  
+```
+
+## Mental Health Qualitative Responses
+This section involves parsing the responses to the multiple choice mental health survey questions, using the stringr natuaral language processing package.
+
+```{r mental health responses}
+#COVID feelings: # a : Nervous, #  b : Anxious or on edge, #  c : Trouble relaxing, #  d : Becoming easily annoyed or irritable, #  e : Afraid that something awful might happen, #  f : None, #  g : Other, #  h : Don't know/No answer
+
+#COVID challenges: #a : Fear of unemployment, b : Fear of contracting COVID-19 (self or family or friend), c : Other health issues, d : Inability to access healthcare service, e : Challenging/problematic, relationships, f : Financial stress and pressure, g : None, h : Other, i : Don't know/No answer"
+
+#COVID communication: a : Chatting to the people I live with (in person), b : Video calling, c : Groups / group chats (e.g. Facebook, WhatsApp), d : Posting/commenting on social media,  e : None,  f : Other,  g : Don't know/No answer"
+
+#COVID news: a : Televised speeches from the government, b : Government social media, c : Press, media, news (non-government), d : Social media (non-government), e : Friends and family, f : None, g : Other, h : Don't know/No answer"
+
+#COVID better: a : Exercised, b : Watched a movie or television show (not the news), c : Kept up to date with the latest news (online or on television), d : Take a nap, e : Chatted to someone, f : Done some remote work, g : Written in my journal, h : Done housework, i : Shared a meal with family members, j : Prayed/meditated, k : Stayed away from problematic people, l : None, m : Other, n : Don't know/No answer"
+
+#COVID resources: a : Televised speeches from the government, b : Government social media, c : Press, media, news (non-government), d : Social media (non-government), e : Friends and family, f : None, g : Other, h : Don't know/No answer"
+
+#COVID quarantine: a. Frustrated and felt ECQ was unnecessary, b. Frustrated but felt ECQ was necessary, c. Indifferent, d. Felt relieved because of ECQ, e. Did not experience ECQ, f. Don't know/No Answer"
+
+#remove words with 2 or more letters
+covid_responses <- survey_data %>% 
+  select(-c(consent:municipality), -c(source:`blocked date`)) %>% 
+  mutate(
+  cov_feelings_a = str_detect(cov_feelings, regex("(?<![:alpha:])a(?![:alpha:])", ignore_case = T)),
+  cov_feelings_b = str_detect(cov_feelings, regex("(?<![:alpha:])b(?![:alpha:])", ignore_case = T)),
+  cov_feelings_c = str_detect(cov_feelings, regex("(?<![:alpha:])c(?![:alpha:])", ignore_case = T)),
+  cov_feelings_d = str_detect(cov_feelings, regex("(?<![:alpha:])d(?![:alpha:])", ignore_case = T)),
+  cov_feelings_e = str_detect(cov_feelings, regex("(?<![:alpha:])e(?![:alpha:])", ignore_case = T)),
+  cov_feelings_f = str_detect(cov_feelings, regex("(?<![:alpha:])f(?![:alpha:])", ignore_case = T)),
+  cov_challenges_a = str_detect(cov_challenges, regex("(?<![:alpha:])a(?![:alpha:])", ignore_case = T)),
+  cov_challenges_b = str_detect(cov_challenges, regex("(?<![:alpha:])b(?![:alpha:])", ignore_case = T)),
+  cov_challenges_c = str_detect(cov_challenges, regex("(?<![:alpha:])c(?![:alpha:])", ignore_case = T)),
+  cov_challenges_d = str_detect(cov_challenges, regex("(?<![:alpha:])d(?![:alpha:])", ignore_case = T)),
+  cov_challenges_e = str_detect(cov_challenges, regex("(?<![:alpha:])e(?![:alpha:])", ignore_case = T)),
+  cov_challenges_f = str_detect(cov_challenges, regex("(?<![:alpha:])f(?![:alpha:])", ignore_case = T)),
+  cov_challenges_g = str_detect(cov_challenges, regex("(?<![:alpha:])g(?![:alpha:])", ignore_case = T)),
+  cov_comm_a = str_detect(cov_communicate, regex("(?<![:alpha:])a(?![:alpha:])", ignore_case = T)),
+  cov_comm_b = str_detect(cov_communicate, regex("(?<![:alpha:])b(?![:alpha:])", ignore_case = T)),
+  cov_comm_c = str_detect(cov_communicate, regex("(?<![:alpha:])c(?![:alpha:])", ignore_case = T)),
+  cov_comm_d = str_detect(cov_communicate, regex("(?<![:alpha:])d(?![:alpha:])", ignore_case = T)),
+  cov_comm_e = str_detect(cov_communicate, regex("(?<![:alpha:])e(?![:alpha:])", ignore_case = T)),
+  cov_news_a = str_detect(cov_news, regex("(?<![:alpha:])a(?![:alpha:])", ignore_case = T)),
+  cov_news_b = str_detect(cov_news, regex("(?<![:alpha:])b(?![:alpha:])", ignore_case = T)),
+  cov_news_c = str_detect(cov_news, regex("(?<![:alpha:])c(?![:alpha:])", ignore_case = T)),
+  cov_news_d = str_detect(cov_news, regex("(?<![:alpha:])d(?![:alpha:])", ignore_case = T)),
+  cov_news_e = str_detect(cov_news, regex("(?<![:alpha:])e(?![:alpha:])", ignore_case = T)),
+  cov_news_f = str_detect(cov_news, regex("(?<![:alpha:])f(?![:alpha:])", ignore_case = T)),
+  cov_better_a = str_detect(cov_better, regex("(?<![:alpha:])a(?![:alpha:])", ignore_case = T)),
+  cov_better_b = str_detect(cov_better, regex("(?<![:alpha:])b(?![:alpha:])", ignore_case = T)),
+  cov_better_c = str_detect(cov_better, regex("(?<![:alpha:])c(?![:alpha:])", ignore_case = T)),
+  cov_better_d = str_detect(cov_better, regex("(?<![:alpha:])d(?![:alpha:])", ignore_case = T)),
+  cov_better_e = str_detect(cov_better, regex("(?<![:alpha:])e(?![:alpha:])", ignore_case = T)),
+  cov_better_f = str_detect(cov_better, regex("(?<![:alpha:])f(?![:alpha:])", ignore_case = T)),
+  cov_better_g = str_detect(cov_better, regex("(?<![:alpha:])g(?![:alpha:])", ignore_case = T)),
+  cov_better_h = str_detect(cov_better, regex("(?<![:alpha:])h(?![:alpha:])", ignore_case = T)),
+  cov_better_i = str_detect(cov_better, regex("(?<![:alpha:])i(?![:alpha:])", ignore_case = T)),
+  cov_better_j = str_detect(cov_better, regex("(?<![:alpha:])j(?![:alpha:])", ignore_case = T)),
+  cov_better_k = str_detect(cov_better, regex("(?<![:alpha:])k(?![:alpha:])", ignore_case = T)),
+  cov_better_l = str_detect(cov_better, regex("(?<![:alpha:])l(?![:alpha:])", ignore_case = T)),
+  cov_resource_a = str_detect(cov_resources, regex("(?<![:alpha:])a(?![:alpha:])", ignore_case = T)),
+  cov_resource_b = str_detect(cov_resources, regex("(?<![:alpha:])b(?![:alpha:])", ignore_case = T)),
+  cov_resource_c = str_detect(cov_resources, regex("(?<![:alpha:])c(?![:alpha:])", ignore_case = T)),
+  cov_resource_d = str_detect(cov_resources, regex("(?<![:alpha:])d(?![:alpha:])", ignore_case = T)),
+  cov_quarantine_a = str_detect(cov_quarantine, regex("(?<![:alpha:])a(?![:alpha:])", ignore_case = T)),
+  cov_quarantine_b = str_detect(cov_quarantine, regex("(?<![:alpha:])b(?![:alpha:])", ignore_case = T)),
+  cov_quarantine_c = str_detect(cov_quarantine, regex("(?<![:alpha:])c(?![:alpha:])", ignore_case = T)),
+  cov_quarantine_d = str_detect(cov_quarantine, regex("(?<![:alpha:])d(?![:alpha:])", ignore_case = T)),
+  cov_quarantine_e = str_detect(cov_quarantine, regex("(?<![:alpha:])e(?![:alpha:])", ignore_case = T))
+) 
+
+covid_results = covid_responses %>% 
+  select(cov_feelings_a:cov_quarantine_e) %>%
+  mutate_all(sum, na.rm = TRUE) %>%
+  gather(key = "variable", value = "Frequency") %>% 
+  unique() %>%  mutate(labels = c("Nervous", "Anxious", "Trouble relaxing", "Easily annoyed", "Afraid", "None",
+                    "Unemployment", "Contracting COVID-19", "Other health issues", "No access to healthcare", "Relationships", "Financial stress", "None",
+                    "In person", "Video calling", "Group chats", "Social media","None",
+                    "Government TV", "Government social media", "News (other)",  "Social media (other)", "Friends & family","None",
+                    "Exercise", "Movies & TV", "News", "Sleep", "Chat", "Work", "Journal", "Housework", "Meal", "Prayer", "Avoidance", "None",
+                    "Dep't of Health", "Non-Governmental Org", "Mental Health Service Provider", "None",
+                    "Frustrated and ECQ unnecessary","Frustrated but ECQ necessary", "Indifferent", "Relieved because of ECQ", "ECQ not applicable")) %>% 
+  rowwise() %>%
+  mutate(variable = strsplit(variable, "_")[[1]][2]) %>% 
+  arrange(desc(variable), desc(Frequency))
+```
+
+```{r VIS mental health responses}
+png("graphics/feelings.png", width = 500, height = 400)
+covid_results %>% filter(variable == "feelings" & labels != "None") %>% ggplot() +
+  geom_col(aes(reorder(labels, -Frequency), Frequency, fill = labels)) +
+  theme_clean() + 
+  xlab("") + 
+  ylab("Number of Observations") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 0, size = 12)) + 
+  scale_fill_brewer(palette = "Set3")+
+  ggtitle("Survey Response: COVID-induced Feelings") +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10))
+dev.off()
+
+png("graphics/challenges.png", width = 500, height = 400)
+covid_results %>% filter(variable == "challenges" & labels != "None") %>% ggplot() +
+  geom_col(aes(reorder(labels, -Frequency), Frequency, fill = labels)) +
+  theme_clean() + 
+  xlab("") + 
+  ylab("Number of Observations") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 0, size = 12)) + 
+  scale_fill_brewer(palette = "Set3")+
+  ggtitle("Survey Response: COVID-induced Challenges") +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10))
+dev.off()
+
+png("graphics/news.png", width = 500, height = 400)
+covid_results %>% filter(variable == "news" & labels != "None") %>% ggplot() +
+  geom_col(aes(reorder(labels, -Frequency), Frequency, fill = labels)) +
+  theme_clean() + 
+  xlab("") + 
+  ylab("Number of Observations") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 0, size = 12)) + 
+  scale_fill_brewer(palette = "Set3")+
+  ggtitle("Survey Response: Information Sources") + 
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10))
+dev.off()
+
+png("graphics/comm.png", width = 500, height = 400)
+covid_results %>% filter(variable == "comm" & labels != "None") %>% ggplot() +
+  geom_col(aes(reorder(labels, -Frequency), Frequency, fill = labels)) +
+  theme_clean() + 
+  xlab("") + 
+  ylab("Number of Observations") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 0, size  = 12)) + 
+  scale_fill_brewer(palette = "Set3")+
+  ggtitle("Survey Response: Communication") + 
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10))
+dev.off()
+
+png("graphics/better.png", width = 500, height = 400)
+covid_results %>% filter(variable == "better" & labels != "None") %>% ggplot() +
+  geom_col(aes(reorder(labels, -Frequency), Frequency, fill = labels)) +
+  theme_clean() + 
+  xlab("") + 
+  ylab("Number of Observations") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 10)) + 
+  scale_fill_brewer(palette = "Set3")+
+  ggtitle("Survey Response: Coping Mechanisms") +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 8))
+  dev.off()
+
+  png("graphics/resources.png", width = 500, height = 400)
+covid_results %>% filter(variable == "resource" & labels != "None") %>% ggplot() +
+  geom_col(aes(reorder(labels, -Frequency), Frequency, fill = labels)) +
+  theme_clean() + 
+  xlab("") + 
+  ylab("Number of Observations") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 0)) + 
+  scale_fill_brewer(palette = "Set3")+
+  ggtitle("Survey Response: Which resource would you share?") +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 8))
+  dev.off()
+  
+  png("graphics/quarantine.png", width = 500, height = 400)
+covid_results %>% filter(variable == "quarantine" & labels != "None") %>% ggplot() +
+  geom_col(aes(reorder(labels, -Frequency), Frequency, fill = labels)) +
+  theme_clean() + 
+  xlab("") + 
+  ylab("Number of Observations") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 0)) + 
+  scale_fill_brewer(palette = "Set3")+
+  ggtitle("Survey Response: Enhanced Community Quarantine (ECQ)") +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 8))
+  dev.off()
+```
+
+
+```{r misc summary statistics}
+
+#Post share rate by treatment group
+survey_data %>% group_by(share_post_assign, out_clickpost) %>% tally()
+
+#Average amount of time taken to complete survey
+
+survey_data <- survey_data %>% 
+  mutate(time_spent = as.period(`last seen` - `signed up`),
+        time_spent = period_to_seconds(time_spent)/60)
+
+survey_data$time_spent[survey_data$time_spent<60] %>% mean()
+
+#Proportion of respondents who requested reminders to contact friends
+survey_data %>% filter(reminders %in% c("1.0","2.0","3.0")) %>% nrow() / nrow(survey_data)
+
+sum(survey_data$out_clickinfo_gov)/nrow(survey_data)
+sum(survey_data$out_clickinfo_ngo)/nrow(survey_data)
+sum(survey_data$out_clickinfo_med)/nrow(survey_data)
+```
+
+## Analysis of Treatment Effects
+
+In this section, we use OLD models to understand the effects of both sets of treatments (post-share rate and CTR), as well as explore potential heterogenous effects using interacted treatment=demographic models. 
+
+
+### Regression -  Data Reading and Preprocessing
+
+```{r analysis data entry}
+analysis_data <- read_xlsx("data/cleaned_input.xlsx")
+
+analysis_data <- analysis_data %>% 
+  filter(hhold!="No Answer") %>% 
+  mutate(hhold = as.integer(hhold))
+```
+
+
+### Pairwise ATE Comparison (Post Share Rate)
+
+```{r Regression Post Share Rate}
+analysis_data %>%
+  group_by(share_post_assign, out_clickpost) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n))
+
+# department of health as baseline group
+lm1.share <- lm(out_clickpost ~ 1+ share_post_assign, data = analysis_data)
+summary(lm1.share)
+
+# NGO as baseline group
+analysis_data$share_post_assign <- relevel(as.factor(analysis_data$share_post_assign), ref = "ngo")
+lm2.share <- lm(out_clickpost ~ 1+ share_post_assign, data = analysis_data)
+summary(lm2.share)
+
+# medical service professional as baseline group
+analysis_data$share_post_assign <- relevel(as.factor(analysis_data$share_post_assign), ref = "med")
+lm3.share <- lm(out_clickpost ~ 1+ share_post_assign, data = analysis_data)
+summary(lm3.share)
+
+# exclude intercept to calculate mean post share rate
+lm.share.noint <- lm(out_clickpost ~ -1 + share_post_assign, data = analysis_data)
+
+summary(lm.share.noint)
+```
+
+
+### Pairwise ATE Comparison (Click Through Rate)
+
+```{r Regression Click Through Rate}
+analysis_data <- analysis_data %>% 
+  mutate(clicks = ifelse(out_clickinfo_gov + out_clickinfo_med + out_clickinfo_ngo > 0, 1, 0))
+
+analysis_data <- analysis_data %>% 
+  mutate(cov_resources_fig = case_when(
+    is.na(cov_resources_fig) ~ "N/A",
+    cov_resources_fig == 1 ~ "image",
+    cov_resources_fig == 2 ~ "infographic",
+    TRUE ~ "image"
+  ))
+
+
+analysis_data <- analysis_data %>% 
+  filter(cov_resources_fig != "N/A") %>%
+  mutate(cov_resources_fig = as.factor(cov_resources_fig))
+
+# comparing against control group
+lm.ctr <- lm(clicks ~ 1+ cov_resources_fig, data = analysis_data)
+summary(lm.ctr)
+
+# exclude intercept to calculate mean click through rate
+lm.ctr_noint <- lm(clicks ~ -1+ cov_resources_fig, data = analysis_data)
+summary(lm.ctr_noint)
+```
+
+### Pairwise ATE Comparison + Covariates (Post Share Rate)
+
+```{r selecting controls}
+# subsetting covariates of interest
+analysis_data_controls <- analysis_data %>% select("age", "sex_modified", "marital_modified", 
+                   "school_modified", "school_level_modified", 
+                   "hhold", "region_modified", "out_clickpost", 
+                   "share_post_assign", "cov_resources_fig", "clicks")
+summary(analysis_data_controls)
+
+# dropping "No Answer" observations for certain covariates
+analysis_data_controls <- analysis_data_controls %>% 
+  filter(hhold!= "No Answer" & sex_modified != "No Answer") %>% 
+  mutate(hhold = as.integer(hhold))
+```
+
+###Share rate model including controls
+```{r Regression + Controls Post Share Rate}
+lm.share.control <- lm(out_clickpost ~ -1 + share_post_assign + age + sex_modified
+                       + marital_modified + school_modified + school_level_modified 
+                       + hhold + region_modified, data = analysis_data_controls)
+summary(lm.share.control)
+
+lm1.share.control <- lm(out_clickpost ~ 1+ share_post_assign + age + sex_modified
+                       + marital_modified + school_modified + school_level_modified 
+                       + hhold + region_modified, data = analysis_data_controls)
+summary(lm1.share.control)
+
+analysis_data_controls$share_post_assign <- relevel(as.factor(analysis_data_controls$share_post_assign), ref = "ngo")
+lm2.share.control <- lm(out_clickpost ~ 1+ share_post_assign + age + sex_modified
+                       + marital_modified + school_modified + school_level_modified 
+                       + hhold + region_modified, data = analysis_data_controls)
+summary(lm2.share.control)
+
+analysis_data_controls$share_post_assign <- relevel(as.factor(analysis_data_controls$share_post_assign), ref = "med")
+lm3.share.control <- lm(out_clickpost ~ 1+ share_post_assign + age + sex_modified
+                       + marital_modified + school_modified + school_level_modified 
+                       + hhold + region_modified, data = analysis_data_controls)
+summary(lm3.share.control)
+```
+
+### Pairwise ATE Comparison + Covariates (Click Through Rate)
+
+```{r Regression + Controls Click Through Rate}
+lm.ctr.control <- lm(clicks ~ 1+ cov_resources_fig + age + sex_modified
+                       + marital_modified + school_modified + school_level_modified 
+                       + hhold + region_modified, data = analysis_data_controls)
+summary(lm.ctr.control)
+
+lm.ctr_noint.control <- lm(clicks ~ -1+ cov_resources_fig + age + sex_modified
+                       + marital_modified + school_modified + school_level_modified 
+                       + hhold + region_modified, data = analysis_data_controls)
+summary(lm.ctr_noint.control)
+```
+
+### Bootstrap method to calculate confidence intervals for coefficients 
+```{r Bootstrap confidence intervals}
+
+# function to obtain regression weights
+bs <- function(formula, data, indices) {
+  d <- data[indices,] # allows boot to select sample
+  fit <- lm(formula, data=d)
+  return(coef(fit))
+}
+
+# boot_error_mean <- function(data, specification){
+# # bootstrapping with R replications, put PM beta first
+# results <- boot(data=data, statistic=bs,
+#    R=1000, formula= specification$call)
+# return(c(quantile(results$t[,1], .025), quantile(results$t[,1], .975)))
+# }
+
+boot_error <- function(data, specification){
+# bootstrapping with R replications, put PM beta first
+results <- boot(data=data, statistic=bs,
+   R=1000, formula= specification$call)
+return(results)
+}
+
+```
+
+### Mean share rate for each treatment arm visualization
+```{r VIS share rate regression}
+
+results_1 = boot_error(analysis_data, lm1.share)
+bounds_1 = c(quantile(results_1$t[,1], .025), quantile(results_1$t[,1], .975))
+
+results_2 = boot_error(analysis_data, lm2.share)
+bounds_2 = c(quantile(results_2$t[,1], .025), quantile(results_2$t[,1], .975))
+
+results_3 = boot_error(analysis_data, lm3.share)
+bounds_3 = c(quantile(results_3$t[,1], .025), quantile(results_3$t[,1], .975))
+
+
+boot_model_bounds = c(bounds_1,
+                 bounds_2,
+                 bounds_3)
+
+model_coefs = tibble("Model" = c("DOH",
+                              "NGO",
+                              "MED"),
+                  "lower" = boot_model_bounds[c(1,3,5)],
+                  "upper" = boot_model_bounds[c(2,4,6)],
+                  "coefficient" = c(summary(lm1.share)$coefficients[1],
+                                        summary(lm2.share)$coefficients[1],
+                                        summary(lm3.share)$coefficients[1]))
+
+png("graphics/mean_share_rate.png", height = 400, width = 700)
+ggplot(model_coefs, aes(x = Model, y = coefficient, color = Model)) +
+  geom_point(size = 2) +
+  theme_classic() +
+  geom_errorbar(aes(ymin = lower, ymax =  upper)) + 
+  geom_hline(yintercept = 0, size = 1, linetype="dashed")+ 
+  ylab("Post Share Rate") + 
+  xlab("Treatment Arm") +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_text(face = "bold",
+                                   size = 14),
+        axis.title = element_text(face = "bold",
+                                   size = 14), 
+        legend.title = element_text(face="bold",
+                                      size = 14),
+        plot.margin=unit(c(1,1,1,1.5),"cm")) +
+  coord_flip()+
+  scale_color_wsj()
+
+dev.off()
+
+
+```
+### Share rate ATE visualization
+```{r VIS adjusted share rate difference}
+results_1 = boot_error(analysis_data, lm1.share)
+bounds_1 = c(quantile(results_1$t[,2], .025), quantile(results_1$t[,2], .975))
+
+results_2 = boot_error(analysis_data, lm2.share)
+bounds_2 = c(quantile(results_2$t[,2], .025), quantile(results_2$t[,2], .975))
+
+results_3 = boot_error(analysis_data, lm3.share)
+bounds_3 = c(quantile(results_3$t[,2], .025), quantile(results_3$t[,2], .975))
+
+
+model_bounds = c(bounds_1,
+                 bounds_2,
+                 bounds_3)
+model_coefs_1 = tibble("Difference" = c("MED - DOH",
+                              "DOH - NGO",
+                              "NGO - MED"),
+                  "lower" = model_bounds[c(1,3,5)],
+                  "upper" = model_bounds[c(2,4,6)],
+                  "coefficient" = c(summary(lm1.share)$coefficients[2],
+                                        summary(lm2.share)$coefficients[2],
+                                        summary(lm3.share)$coefficients[2]),
+                  "Model Specification" = rep("No Controls", 3),
+                  "Model" = 1:3)
+
+adj_model_bounds = c(-1*confint(lm1.share.control)[3,],
+                 confint(lm2.share.control)[3,],
+                 confint(lm3.share.control)[2,])
+
+model_coefs_2 = tibble("Difference" = c("MED - DOH",
+                              "DOH - NGO",
+                              "NGO - MED"),
+                  "lower" = adj_model_bounds[c(1,3,5)],
+                  "upper" = adj_model_bounds[c(2,4,6)],
+                  "coefficient" = c(-1*summary(lm1.share.control)$coefficients[3],
+                                        summary(lm2.share.control)$coefficients[3],
+                                        summary(lm3.share.control)$coefficients[2]),
+                  "Model Specification" = rep("Incl. Controls", 3),
+                  "Model" = 4:6)
+
+model_coefs <- bind_rows(model_coefs_1, model_coefs_2) 
+
+png("graphics/adj_diff_share_rate.png", height = 400, width = 700)
+ggplot(model_coefs, aes(x = Model, y = coefficient, color = Difference)) +
+  geom_point(size = 2) +
+  theme_clean() +
+  geom_errorbar(aes(ymin = lower, ymax =  upper, linetype = `Model Specification`)) + 
+  geom_hline(yintercept = 0, size = 1, linetype="dashed")+ 
+  ylab("Difference in Post Share Rate") + 
+  ggtitle("Difference in Share Rate across Treatments",  subtitle = "95% confidence intervals shown (no controls -> bootstrapped, controls -> normally dist.)") +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_text(face = "bold",
+                                   size = 14),
+        axis.title = element_text(face = "bold",
+                                   size = 14), 
+        legend.title = element_text(face="bold",
+                                      size = 14),
+        plot.margin=unit(c(1,1,1,1.5),"cm")) +
+  coord_flip()+
+  scale_color_wsj()
+
+dev.off()
+```
+
+### CTR visualization
+```{r VIS CTR}
+results_1 = boot_error(analysis_data, lm.ctr)
+bounds_2 = c(quantile(results_2$t[,2], .025), quantile(results_2$t[,2], .975))
+bounds_3 = c(quantile(results_3$t[,3], .025), quantile(results_3$t[,3], .975))
+
+
+model_bounds = c(bounds_2,
+                 bounds_3)
+model_coefs_1 = tibble("Treatment Arm" = c("Image",
+                              "Infographic"),
+                  "lower" = model_bounds[c(1,3)],
+                  "upper" = model_bounds[c(2,4)],
+                  "coefficient" = c(summary(lm.ctr)$coefficients[2],
+                                        summary(lm.ctr)$coefficients[3]),
+                  "Model Specification" = rep("No Controls", 2),
+                  "Model" = 1:2)
+
+adj_model_bounds = c(confint(lm.ctr.control)[2,],
+                 confint(lm.ctr.control)[3,])
+
+model_coefs_2 = tibble("Treatment Arm" = c("Image",
+                              "Infographic"),
+                  "lower" = adj_model_bounds[c(1,3)],
+                  "upper" = adj_model_bounds[c(2,4)],
+                  "coefficient" = c(summary(lm.ctr.control)$coefficients[2],
+                                        summary(lm.ctr.control)$coefficients[3]),
+                  "Model Specification" = rep("Incl. Controls", 2),
+                  "Model" = 3:4)
+
+model_coefs <- bind_rows(model_coefs_1, model_coefs_2) 
+
+
+png("graphics/adj_diff_CTR.png", height = 400, width = 700)
+ggplot(model_coefs, aes(x = Model, y = coefficient*100, color = `Treatment Arm`)) +
+  geom_point(size = 2) +
+  theme_clean() +
+  geom_errorbar(aes(ymin = lower*100, ymax =  upper*100, linetype = `Model Specification`)) + 
+  geom_hline(yintercept = 0, size = 1, linetype="dashed")+ 
+  ylab("Change in CTR (%)") + 
+  ggtitle("Difference in CTR across Treatments",  subtitle = "95% confidence intervals shown (no controls -> bootstrapped, controls -> normally dist.)") +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_text(face = "bold",
+                                   size = 14),
+        axis.title = element_text(face = "bold",
+                                   size = 14), 
+        legend.title = element_text(face="bold",
+                                      size = 14),
+        plot.margin=unit(c(1,1,1,1.5),"cm")) +
+  coord_flip()+
+  scale_color_wsj()
+
+dev.off()
+
+confint(lm.ctr_noint)
+model_bounds
+```
+
+
+
+## Conditional ATE
+
+### Goal: Investigate whether certain covariate would affect the treatment effect
+
+Grouping some of the covariates to avoid too many levels within each covariate and make effective comparisons.
+
+**Age (segments):** We are segmenting it in three different groups: young (18-25 years old), adults (26-49 years old) and elders (50 years old or more). 
+
+**Marital Status:** Those who are living with their partner and those who don't. Taking no answer as living without a partner.
+
+**School Levels (two groups):** Those with a post-secondary degree and those do not have a post-secondary degree 
+
+**Number of people in household (two groups): ** Those who are living by themselves and those are not
+
+**Region (two groups):** 
+
+Those regions that pass the average national urbanization level (51.2%) : 1) National Capital Region (100%), 2) Calabarzonn (66.4%), 3) Davao (63.5%), 4) Central Luzon (61.6%), 5) Soccsksargen (51.6%), and those regions that do not.
+
+[Source] http://www.psa.gov.ph/content/urban-population-philippines-results-2015-census-population
+
+
+```{r grouping}
+#Age segments
+analysis_data_controls <- analysis_data_controls %>% mutate(age_segment = ifelse(age <= 25, "young", ifelse(age > 25 & age < 50, "adults", ifelse(age >= 50, "elders", NA))))
+analysis_data_controls %>% count(age_segment)
+
+#Marital Modified
+analysis_data_controls %>% count(marital_modified)
+coliving <- c("Common-law/live-in", "Married")
+analysis_data_controls <- analysis_data_controls %>% mutate(marital_coliving = ifelse(marital_modified %in% coliving, 1, 0))
+
+# School level
+analysis_data_controls %>% count(school_level_modified)
+college_plus <- c("College grad", "Post baccalaureate", "Post secondary grad")
+analysis_data_controls <- analysis_data_controls %>% mutate(school_level_grouped = ifelse(school_level_modified %in% college_plus, 1, 0))
+
+# Number of people in household
+analysis_data_controls %>% count(hhold)
+analysis_data_controls <- analysis_data_controls %>% mutate(hhold_grouped = ifelse(hhold == 1, 0, 1))
+
+# Region
+analysis_data_controls %>% count(region_modified)
+urban <- c("NCR", "Calabarzon", "Davao", "Central Luzon", "Soccsksargen")
+analysis_data_controls <- analysis_data_controls %>% mutate(region_grouped = ifelse(region_modified %in% urban, 1, 0))
+```
+
+
+```{r scale}
+# scale continuous variable
+analysis_data_controls <- analysis_data_controls %>% mutate(age = as.vector(scale(age)),
+hhold = as.vector(scale(hhold)))
+```
+
+**Age**
+
+We are interested in measuring if an extra year of age would affect one's post share rate and the click through rate. In this case, age is a continuous variable, so we are measuring how an extra year in age changes the treatment effect.
+
+```{r age}
+lm.interact.age.share = lm(out_clickpost ~ age * share_post_assign, data = analysis_data_controls)
+summary(lm.interact.age.share)
+
+lm.interact.age.click = lm(clicks ~ age * cov_resources_fig, data = analysis_data_controls)
+summary(lm.interact.age.click)
+```
+
+**Age Segments**
+
+We are interested in measuring if being part of a group of a different changes the treatment effect in each group for click through rate and share post.
+
+```{r age segments}
+lm.interact.age.segments.share = lm(out_clickpost ~ age_segment * share_post_assign, data = analysis_data_controls)
+summary(lm.interact.age.segments.share)
+
+lm.interact.age.segments.click = lm(clicks ~ age_segment * cov_resources_fig, data = analysis_data_controls)
+summary(lm.interact.age.segments.click)
+```
+
+**Sex**
+
+We are interested in measuring if being a man respectively to being a women changes the treatment effect in each group for click through rate and share post.
+
+```{r sex}
+lm.interact.sex.share = lm(out_clickpost ~ sex_modified * share_post_assign, data = analysis_data_controls)
+summary(lm.interact.sex.share)
+
+lm.interact.sex.click = lm(clicks ~ sex_modified * cov_resources_fig, data = analysis_data_controls)
+summary(lm.interact.sex.click)
+```
+
+**School**
+
+We are interested in measuring if being at school affects the treatment effect of the click through rate and share post versus not being at school.
+
+```{r school}
+lm.interact.school.share = lm(out_clickpost ~ school_modified  * share_post_assign, data = analysis_data_controls)
+summary(lm.interact.school.share)
+
+lm.interact.school.click = lm(clicks ~ school_modified * cov_resources_fig, data = analysis_data_controls)
+summary(lm.interact.school.click)
+```
+
+
+**School Level**
+
+We are interested in measuring whether school level would affect one's post share rate. We split the school levels into two groups: those with a post-secondary degree and those do not have a post-secondary degree to see if the treatment effect would be different.
+
+```{r school_level}
+lm.interact.schoolLevel.share = lm(out_clickpost ~ school_level_grouped * share_post_assign, data = analysis_data_controls)
+summary(lm.interact.schoolLevel.share)
+
+lm.interact.schoolLevel.click = lm(clicks ~ school_level_grouped * cov_resources_fig, data = analysis_data_controls)
+summary(lm.interact.schoolLevel.click)
+```
+
+**Number of people in household**
+
+We are interested in measuring whether household size would affect one's post share rate. 
+
+```{r hhold}
+# Using household as a continuous variable
+lm.interact.hhold.share = lm(out_clickpost ~ hhold * share_post_assign, data = analysis_data_controls)
+summary(lm.interact.hhold.share)
+
+lm.interact.hhold.click = lm(clicks ~ hhold * cov_resources_fig, data = analysis_data_controls)
+summary(lm.interact.hhold.click)
+
+# Using household size as a binary variable
+lm.interact.hholdGrouped.share = lm(out_clickpost ~ hhold * share_post_assign, data = analysis_data_controls)
+summary(lm.interact.hholdGrouped.share)
+
+lm.interact.hholdGrouped.click = lm(clicks ~ hhold * cov_resources_fig, data = analysis_data_controls)
+summary(lm.interact.hholdGrouped.click)
+```
+
+**Region**
+
+We are interested in measuring whether urbanization would affect one's post share rate. 
+
+```{r region}
+
+lm.interact.region.share = lm(out_clickpost ~ region_grouped * share_post_assign, data = analysis_data_controls)
+summary(lm.interact.region.share)
+
+lm.interact.region.click = lm(clicks ~  region_grouped + region_grouped * cov_resources_fig, data = analysis_data_controls)
+summary(lm.interact.region.click)
+```
+
+
+
+
+
